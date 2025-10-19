@@ -50,3 +50,4 @@ WIP: on going dev for my local hyprland setup
     + snapper
     - gnome-keyring
       + libsecret
+      + seahorse
