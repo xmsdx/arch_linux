@@ -48,6 +48,3 @@ WIP: on going dev for my local hyprland setup
     + git
     + ufw
     + snapper
-    - gnome-keyring
-      + libsecret
-      + seahorse
