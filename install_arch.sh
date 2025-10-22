@@ -204,7 +204,7 @@ PACKAGES=(
   base linux linux-firmware linux-headers
   btrfs-progs base-devel networkmanager grub efibootmgr intel-ucode
   libinput cpupower bluez bluez-utils mesa tlp acpi acpid pipewire pipewire-pulse wireplumber
-  iio-sensor-proxy thermald man-db man-pages openssh wget curl nano sudo git ufw snapper
+  iio-sensor-proxy thermald man-db man-pages ufw snapper wget curl nano sudo git openssh fastfetch kitty hyprland
 )
 
 log "Installing base system (pacstrap)"
