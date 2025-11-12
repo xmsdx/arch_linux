@@ -2,7 +2,7 @@
 # -----------------------------------------------------------------------------
 # Unified Arch Linux Installation Script for Dell XPS 13 9365 (NVMe 512GB)
 # Supports: (A) Encrypted install (LUKS2 + BTRFS + Encrypted Swap) OR
-#           (B) Non-encrypted install (BTRFS + Standard Swap File)
+#           (B) Non-encrypted install (BTRFS + Standard Swap File/Partition)
 # Bootloader: GRUB (chosen for recovery flexibility and broad tooling support)
 # Filesystem: BTRFS with subvolumes: @, @home, @snapshots, @var_log, @var_cache
 # Swap:      Separate encrypted LUKS partition (hibernation capable) OR swapfile
@@ -16,8 +16,6 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# (Dry run support removed per user request)
-
 # ------------------------------
 # User Adjustable Variables (defaults - will prompt)
 # ------------------------------
@@ -27,7 +25,8 @@ USERNAME_DEFAULT="player1"     # Initial user
 TIMEZONE_DEFAULT="America/Denver"
 LOCALE_DEFAULT="en_US.UTF-8"
 KEYMAP_DEFAULT="us"
-SWAPSIZE_GIB_DEFAULT=16         # Desired swap size in GiB (converted to MiB dynamically)
+# Default swap: 'auto' -> reserve a small tail (~512 MiB). You can enter a number (GiB) like 0.5, 1, 2, etc.
+SWAPSIZE_GIB_DEFAULT="auto"
 BTRFS_COMPRESS="zstd:3"         # Compression level (adjustable)
 ESP_SIZE_MB=512                 # EFI System Partition size in MiB
 MIN_ROOT_MB=20480               # Minimum root size safeguard (20 GiB)
@@ -45,7 +44,7 @@ flush_writes() { sync; udevadm settle || true; }
 # Pre-flight Checks
 # ------------------------------
 log "Validating live environment prerequisites"
-for c in pacstrap parted sgdisk cryptsetup mkfs.btrfs grub-install grub-mkconfig; do require_cmd "$c"; done
+for c in pacman pacstrap parted sgdisk cryptsetup mkfs.btrfs grub-install grub-mkconfig; do require_cmd "$c"; done
 command -v ip >/dev/null && ip link || true
 
 if ! ping -c1 -W2 archlinux.org >/dev/null 2>&1; then
@@ -63,11 +62,11 @@ read -r -p "Username [$USERNAME_DEFAULT]: " USERNAME_INPUT; USERNAME="${USERNAME
 read -r -p "Locale [$LOCALE_DEFAULT]: " LOCALE_INPUT; LOCALE="${LOCALE_INPUT:-$LOCALE_DEFAULT}";
 read -r -p "Keymap [$KEYMAP_DEFAULT]: " KEYMAP_INPUT; KEYMAP="${KEYMAP_INPUT:-$KEYMAP_DEFAULT}";
 read -r -p "Timezone [$TIMEZONE_DEFAULT]: " TIMEZONE_INPUT; TIMEZONE="${TIMEZONE_INPUT:-$TIMEZONE_DEFAULT}";
-read -r -p "Swap size GiB [$SWAPSIZE_GIB_DEFAULT]: " SWAP_GIB_INPUT; SWAPSIZE_GIB="${SWAP_GIB_INPUT:-$SWAPSIZE_GIB_DEFAULT}";
+read -r -p "Swap size in GiB (or 'auto' to reserve a small tail ~512MiB) [$SWAPSIZE_GIB_DEFAULT]: " SWAP_GIB_INPUT; SWAPSIZE_GIB="${SWAP_GIB_INPUT:-$SWAPSIZE_GIB_DEFAULT}";
 
 log "Choose installation type:";
 echo "  1) Encrypted (LUKS2 root + encrypted swap partition)"
-echo "  2) Non-encrypted (plain BTRFS root + swapfile)"
+echo "  2) Non-encrypted (plain BTRFS root + swap partition or swapfile)"
 read -r -p "Enter choice [1/2]: " ENC_CHOICE
 [[ "$ENC_CHOICE" == "1" || "$ENC_CHOICE" == "2" ]] || err "Invalid choice"
 ENCRYPTED=$([[ "$ENC_CHOICE" == "1" ]] && echo 1 || echo 0)
@@ -92,7 +91,14 @@ if [[ $ENCRYPTED -eq 1 ]]; then
   done
 fi
 
-log "Summary:\n  Hostname: $HOSTNAME\n  User: $USERNAME\n  Encrypted: $([[ $ENCRYPTED -eq 1 ]] && echo YES || echo NO)\n  Swap GiB: $SWAPSIZE_GIB\n  Timezone: $TIMEZONE\n  Locale: $LOCALE\n  Keymap: $KEYMAP"
+log "Summary:
+  Hostname: $HOSTNAME
+  User: $USERNAME
+  Encrypted: $([[ $ENCRYPTED -eq 1 ]] && echo YES || echo NO)
+  Swap: $SWAPSIZE_GIB
+  Timezone: $TIMEZONE
+  Locale: $LOCALE
+  Keymap: $KEYMAP"
 confirm "Proceed with disk wipe and install on $DISK?" || err "Aborted by user"
 
 # ------------------------------
@@ -100,15 +106,35 @@ confirm "Proceed with disk wipe and install on $DISK?" || err "Aborted by user"
 # ------------------------------
 DISK_SIZE_BYTES=$(blockdev --getsize64 "$DISK")
 DISK_SIZE_MB=$(( DISK_SIZE_BYTES / 1024 / 1024 ))
-SWAP_SIZE_MB=$(( SWAPSIZE_GIB * 1024 ))
 
-# Validate swap size feasibility
-[ $SWAP_SIZE_MB -lt $((DISK_SIZE_MB / 2)) ] || log "Large swap selected (>=50% of disk). Continuing."
-ROOT_END_MB=$(( DISK_SIZE_MB - SWAP_SIZE_MB ))
-ROOT_SIZE_MB=$(( ROOT_END_MB - ESP_SIZE_MB ))
-[ $ROOT_SIZE_MB -ge $MIN_ROOT_MB ] || err "Root size ($ROOT_SIZE_MB MiB) < minimum ($MIN_ROOT_MB MiB). Reduce swap size."
+# Determine swap size in MiB:
+# - If user specified "auto" or left blank -> reserve a small tail: 512 MiB (approx)
+# - If user specified a number (can be fractional, e.g. 0.5) -> convert GiB->MiB
+if [[ -z "$SWAPSIZE_GIB" || "$SWAPSIZE_GIB" == "auto" ]]; then
+  SWAP_SIZE_MB=512
+  log "Swap set to 'auto' -> reserving ${SWAP_SIZE_MB} MiB at end of disk"
+else
+  # Accept decimal numbers (e.g., 0.5 GiB). Use awk for floating conversion to integer MiB.
+  SWAP_SIZE_MB=$(awk -v g="$SWAPSIZE_GIB" 'BEGIN{ if (g+0 <= 0) { print 0; } else { printf("%d", g*1024); } }')
+  if [[ -z "$SWAP_SIZE_MB" || "$SWAP_SIZE_MB" -le 0 ]]; then
+    err "Invalid swap size provided: $SWAPSIZE_GIB"
+  fi
+  log "User requested swap size: ${SWAPSIZE_GIB} GiB -> ${SWAP_SIZE_MB} MiB"
+fi
 
-log "Calculated layout (MiB):\n  Disk: ${DISK_SIZE_MB}\n  ESP: 0-$(($ESP_SIZE_MB))\n  Root: ${ESP_SIZE_MB}-${ROOT_END_MB} (size ${ROOT_SIZE_MB})\n  Swap: ${ROOT_END_MB}-${DISK_SIZE_MB} (size ${SWAP_SIZE_MB})"
+# Compute root size and validate
+ROOT_SIZE_MB=$(( DISK_SIZE_MB - ESP_SIZE_MB - SWAP_SIZE_MB ))
+[ $ROOT_SIZE_MB -ge $MIN_ROOT_MB ] || err "Root size (${ROOT_SIZE_MB} MiB) < minimum (${MIN_ROOT_MB} MiB). Reduce swap size or increase disk."
+
+ROOT_END_MB=$(( ESP_SIZE_MB + ROOT_SIZE_MB ))  # end offset for root (MiB)
+
+log "Calculated layout (MiB):"
+log "  Disk total: ${DISK_SIZE_MB} MiB"
+log "  EFI (ESP): 0 - ${ESP_SIZE_MB} MiB"
+log "  Root: ${ESP_SIZE_MB} - ${ROOT_END_MB} (size ${ROOT_SIZE_MB} MiB)"
+log "  Swap: ${ROOT_END_MB} - ${DISK_SIZE_MB} (size ${SWAP_SIZE_MB} MiB)"
+
+confirm "Proceed with disk wipe and install on $DISK?" || err "Aborted by user"
 
 # ------------------------------
 # Full Disk Wipe (Headers + GPT + Residual LUKS) - destructive
@@ -131,71 +157,58 @@ sleep 2
 # ------------------------------
 log "Creating GPT partitions"
 sgdisk -n 1:0:+${ESP_SIZE_MB}MiB -t 1:ef00 -c 1:"EFI" "$DISK"
-sgdisk -n 2:0:+$(( ROOT_SIZE_MB ))MiB -t 2:8300 -c 2:"ROOT" "$DISK"
+sgdisk -n 2:0:+${ROOT_SIZE_MB}MiB -t 2:8300 -c 2:"ROOT" "$DISK"
 sgdisk -n 3:0:+${SWAP_SIZE_MB}MiB -t 3:8200 -c 3:"SWAP" "$DISK"
 flush_writes
 partprobe "$DISK"; sleep 2
 
-EFI_PART="${DISK}p1"
-ROOT_PART="${DISK}p2"
-SWAP_PART="${DISK}p3"
+if [[ "$DISK" =~ nvme ]]; then
+  EFI_PART="${DISK}p1"
+  ROOT_PART="${DISK}p2"
+  SWAP_PART="${DISK}p3"
+else
+  EFI_PART="${DISK}1"
+  ROOT_PART="${DISK}2"
+  SWAP_PART="${DISK}3"
+fi
 
 log "Partition table created:"
 lsblk -o NAME,SIZE,TYPE,PARTTYPE,MOUNTPOINT "$DISK"
 
 # ------------------------------
-# Encryption (if selected)
+# Ensure mirrors & keyring updated BEFORE pacstrap
 # ------------------------------
-if [[ $ENCRYPTED -eq 1 ]]; then
-  log "Setting up LUKS2 encryption (argon2id) for root"
-  echo -n "$ENCRYPT_PASSWORD" | cryptsetup luksFormat --type luks2 --pbkdf argon2id --label cryptroot "$ROOT_PART" -
-  echo -n "$ENCRYPT_PASSWORD" | cryptsetup open "$ROOT_PART" cryptroot -
+log "Refreshing pacman keyring and mirrorlist before pacstrap"
 
-  log "Setting up LUKS2 encryption for swap"
-  echo -n "$ENCRYPT_PASSWORD" | cryptsetup luksFormat --type luks2 --pbkdf argon2id --label cryptswap "$SWAP_PART" -
-  echo -n "$ENCRYPT_PASSWORD" | cryptsetup open "$SWAP_PART" cryptswap -
-  mkswap /dev/mapper/cryptswap
-  swapon /dev/mapper/cryptswap
-  ROOT_MAPPED="/dev/mapper/cryptroot"
+# Update keyring (best-effort)
+log "Updating archlinux-keyring (best-effort) to avoid signature issues"
+if pacman -Qi archlinux-keyring >/dev/null 2>&1; then
+  pacman -Sy --noconfirm archlinux-keyring || log "Warning: archlinux-keyring update failed"
 else
-  log "Non-encrypted path selected"
-  ROOT_MAPPED="$ROOT_PART"
-  mkswap "$SWAP_PART"; swapon "$SWAP_PART"
+  pacman -Sy --noconfirm archlinux-keyring || log "Warning: archlinux-keyring install/update failed"
 fi
 
-# ------------------------------
-# Filesystem Formatting
-# ------------------------------
-log "Formatting EFI and Root (BTRFS)"
-mkfs.fat -F32 "$EFI_PART"
-mkfs.btrfs -f -L arch_root "$ROOT_MAPPED"
+# Install reflector if missing and refresh mirrorlist
+if ! command -v reflector >/dev/null 2>&1; then
+  log "Installing reflector to refresh mirrorlist"
+  pacman -Sy --noconfirm --needed reflector || err "Failed to install reflector required to update mirrorlist"
+fi
 
-# ------------------------------
-# BTRFS Subvolumes
-# ------------------------------
-log "Creating BTRFS subvolumes"
-TEMP_MNT="/mnt/btrfs_setup"
-mkdir -p "$TEMP_MNT"
-mount -o defaults,noatime "$ROOT_MAPPED" "$TEMP_MNT"
-btrfs subvolume create "$TEMP_MNT/@"
-btrfs subvolume create "$TEMP_MNT/@home"
-btrfs subvolume create "$TEMP_MNT/@snapshots"
-btrfs subvolume create "$TEMP_MNT/@var_log"
-btrfs subvolume create "$TEMP_MNT/@var_cache"
-umount "$TEMP_MNT"
+# Try to infer a country from timezone; fallback to latest fastest mirrors
+COUNTRY=$(echo "$TIMEZONE" | awk -F/ '{print $1}')
+if [[ -n "$COUNTRY" && "$COUNTRY" != "UTC" ]]; then
+  log "Updating mirrorlist for country: $COUNTRY"
+  reflector --country "$COUNTRY" --age 12 --protocol https --sort rate --save /etc/pacman.d/mirrorlist || {
+    log "reflector country-based update failed; trying latest mirrors"
+    reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist || log "Failed to update mirrorlist via reflector; pacstrap may be slow or fail"
+  }
+else
+  log "Updating mirrorlist using latest 20 https mirrors"
+  reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist || log "Failed to update mirrorlist via reflector; pacstrap may be slow or fail"
+fi
 
-# ------------------------------
-# Mount Final Layout
-# ------------------------------
-log "Mounting final subvolume layout"
-mount -o noatime,compress=${BTRFS_COMPRESS},ssd,discard=async,subvol=@ "$ROOT_MAPPED" /mnt
-mkdir -p /mnt/{boot,home,.snapshots,var/log,var/cache}
-mount -o noatime,compress=${BTRFS_COMPRESS},ssd,discard=async,subvol=@home "$ROOT_MAPPED" /mnt/home
-mount -o noatime,compress=${BTRFS_COMPRESS},ssd,discard=async,subvol=@snapshots "$ROOT_MAPPED" /mnt/.snapshots
-mount -o noatime,compress=${BTRFS_COMPRESS},ssd,discard=async,subvol=@var_log "$ROOT_MAPPED" /mnt/var/log
-mount -o noatime,compress=${BTRFS_COMPRESS},ssd,discard=async,subvol=@var_cache "$ROOT_MAPPED" /mnt/var/cache
-mount "$EFI_PART" /mnt/boot
-chmod 750 /mnt/.snapshots
+log "Mirrorlist refreshed (or best-effort attempt made). Showing top 10 mirrors:"
+head -n 40 /etc/pacman.d/mirrorlist || true
 
 # ------------------------------
 # Base Package List
@@ -208,7 +221,8 @@ PACKAGES=(
 )
 
 log "Installing base system (pacstrap)"
-pacstrap /mnt "${PACKAGES[@]}"
+# Use --noconfirm --needed to avoid interactive prompts and unnecessary reinstallation
+pacstrap /mnt --noconfirm --needed "${PACKAGES[@]}"
 
 # ------------------------------
 # fstab Generation & Adjustments
